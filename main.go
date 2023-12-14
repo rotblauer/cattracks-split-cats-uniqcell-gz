@@ -28,7 +28,7 @@ var flagCellLevel = flag.Int("cell-level", sufficientPrecisionLevel, fmt.Sprintf
 var flagDBPath = flag.String("db", filepath.Join(".", "cat-uniqs.db"), "Path to database for unique cat/tracks")
 var flagCacheSize = flag.Int("cache-size", 100000, "Size of cache for unique cat/tracks")
 var flagOutputRootFilepath = flag.String("output", filepath.Join(".", "output"), "Output root dir")
-var flagWorkers = flag.Int("workers", 1, "Number of workers")
+var flagWorkers = flag.Int("workers", 8, "Number of workers")
 var compressionLevel = gzip.DefaultCompression
 var flagCompression = flag.Int("compression-level", compressionLevel, fmt.Sprintf("Compression level (Default=%d, BestSpeed=%d, BestCompression=%d)", gzip.DefaultCompression, gzip.BestSpeed, gzip.BestCompression))
 
