@@ -147,15 +147,16 @@ func appendGZipLines(lines [][]byte, fname string) error {
 }
 
 var aliases = map[*regexp.Regexp]string{
-	regexp.MustCompile("(?i)(Rye.*|Kitty.*|.*jl.*)"):             "rye",
-	regexp.MustCompile(`(?i)(.*Papa.*|P2|Isaac.*|.*moto.*|iha)`): "ia",
-	regexp.MustCompile(`(?i)(Big.*Ma.*)`):                        "jr",
-	regexp.MustCompile("(?i)Kayleigh.*"):                         "kd",
-	regexp.MustCompile("(?i)(KK.*|kek)"):                         "kk",
-	regexp.MustCompile("(?i)Bob.*"):                              "rj",
-	regexp.MustCompile("(?i)(Pam.*|Rathbone.*)"):                 "pr",
-	regexp.MustCompile("(?i)(Ric|.*A3_Pixel_XL.*)"):              "ric",
-	regexp.MustCompile("(?i)Twenty7.*"):                          "mat",
+	regexp.MustCompile("(?i)(Rye.*|Kitty.*|jl)"):                          "rye",
+	regexp.MustCompile(`(?i)(.*Papa.*|P2|Isaac.*|.*moto.*|iha|ubp52)`):    "ia",
+	regexp.MustCompile(`(?i)(Big.*Ma.*)`):                                 "jr",
+	regexp.MustCompile("(?i)Kayleigh.*"):                                  "kd",
+	regexp.MustCompile("(?i)(KK.*|kek)"):                                  "kk",
+	regexp.MustCompile("(?i)Bob.*"):                                       "rj",
+	regexp.MustCompile("(?i)(Pam.*|Rathbone.*)"):                          "pr",
+	regexp.MustCompile("(?i)(Ric|.*A3_Pixel_XL.*|.*marlin-Pixel-222d.*)"): "ric",
+	regexp.MustCompile("(?i)Twenty7.*"):                                   "mat",
+	regexp.MustCompile("(?i)(.*Carlomag.*|JLC|jlc)"):                      "jlc",
 }
 
 func aliasOrName(name string) string {
