@@ -24,15 +24,17 @@ import (
 // // https://s2geometry.io/resources/s2cell_statistics.html
 // // 23 	0.73 	1.52 	1.21 	m2 	  	83 cm 	116 cm 	  	110 cm 	120 cm 	422T
 var sufficientPrecisionLevel = 23
-var flagCellLevel = flag.Int("cell-level", sufficientPrecisionLevel, fmt.Sprintf("S2 Cell Level (Default=%d)", sufficientPrecisionLevel))
-var flagDBPath = flag.String("db", filepath.Join(".", "cat-uniqs.db"), "Path to database for unique cat/tracks")
-var flagCacheSize = flag.Int("cache-size", 100000, "Size of cache for unique cat/tracks")
-var flagOutputRootFilepath = flag.String("output", filepath.Join(".", "output"), "Output root dir")
-var flagWorkers = flag.Int("workers", 8, "Number of workers")
 var compressionLevel = gzip.DefaultCompression
-var flagCompression = flag.Int("compression-level", compressionLevel, fmt.Sprintf("Compression level (Default=%d, BestSpeed=%d, BestCompression=%d)", gzip.DefaultCompression, gzip.BestSpeed, gzip.BestCompression))
+var defaultOutputRoot = filepath.Join(".", "output")
 
-var db *bolt.DB
+var flagCellLevel = flag.Int("cell-level", sufficientPrecisionLevel, fmt.Sprintf("S2 Cell Level (Default=%d)", sufficientPrecisionLevel))
+var flagCompression = flag.Int("compression-level", compressionLevel, fmt.Sprintf("Compression level (Default=%d, BestSpeed=%d, BestCompression=%d)", gzip.DefaultCompression, gzip.BestSpeed, gzip.BestCompression))
+var flagCacheSize = flag.Int("cache-size", 1_000_000, "Size of cache for unique cat/tracks")
+var flagWorkers = flag.Int("workers", 8, "Number of workers")
+var flagOutputRootFilepath = flag.String("output", defaultOutputRoot, "Output root dir")
+var flagDBRootPath = flag.String("db", filepath.Join(defaultOutputRoot, "dbs"), "Path to databases root for unique cat/tracks")
+
+var dbs = make(map[string]*bolt.DB)
 var cache *lru.Cache[string, bool]
 
 func init() {
@@ -94,6 +96,7 @@ func appendGZipLines(lines [][]byte, fname string) error {
 		flocks[fname] = new(sync.Mutex)
 	}
 	metaflock.Unlock()
+
 	flocks[fname].Lock()
 	defer flocks[fname].Unlock()
 
@@ -151,20 +154,45 @@ func getCatTrackCacheKey(cat string, cellID s2.CellID) string {
 	return fmt.Sprintf("%s:%s", cat, cellID.ToToken())
 }
 
-func trackCache(cat string, cellID s2.CellID) (uniq bool) {
+func trackCache(cat string, cellID s2.CellID) (exists bool) {
 	key := getCatTrackCacheKey(cat, cellID)
 	if _, ok := cache.Get(key); ok {
-		return false
+		return ok
 	}
 	cache.Add(key, true)
-	return true
+	return false
 }
 
-func trackDB(cat string, cellID s2.CellID) (uniq bool) {
+var metaDBsLock = new(sync.Mutex)
+var dbsMuLock = make(map[string]*sync.Mutex)
+
+func getOrInitCatDB(cat string) *bolt.DB {
+	if _, ok := dbsMuLock[cat]; !ok {
+		metaDBsLock.Lock()
+		dbsMuLock[cat] = new(sync.Mutex)
+		metaDBsLock.Unlock()
+	}
+	dbsMuLock[cat].Lock()
+	defer dbsMuLock[cat].Unlock()
+
+	if db, ok := dbs[cat]; ok {
+		return db
+	}
+	db, err := bolt.Open(filepath.Join(*flagDBRootPath, fmt.Sprintf("%s-level.%d.db", cat, *flagCellLevel)), 0600, nil)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	dbs[cat] = db
+	return db
+}
+
+func tracksDBExists(cat string, cellID s2.CellID) (err error, exists bool) {
+	db := getOrInitCatDB(cat)
+	// defer db.Close()
 	// check db
-	var exists bool
-	_ = db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(cat))
+	bucket := []byte{byte(*flagCellLevel)}
+	err = db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucket)
 		if b == nil {
 			return nil
 		}
@@ -172,22 +200,32 @@ func trackDB(cat string, cellID s2.CellID) (uniq bool) {
 		exists = v != nil
 		return nil
 	})
-	if exists {
-		return false
+	if err != nil {
+		return err, false
 	}
-	_ = db.Update(func(tx *bolt.Tx) error {
-		b, err := tx.CreateBucketIfNotExists([]byte(cat))
+	if exists {
+		return nil, true
+	}
+	return err, false
+}
+
+func tracksDBWriteUniqs(cat string, cellIDs []s2.CellID) (err error) {
+	db := getOrInitCatDB(cat)
+	// defer db.Close()
+	return db.Update(func(tx *bolt.Tx) error {
+		bucket := []byte{byte(*flagCellLevel)}
+		b, err := tx.CreateBucketIfNotExists(bucket)
 		if err != nil {
 			return err
 		}
-		err = b.Put([]byte(cellID.ToToken()), []byte{0x1})
-		if err != nil {
-			return err
+		for _, cellID := range cellIDs {
+			err = b.Put([]byte(cellID.ToToken()), []byte{0x1})
+			if err != nil {
+				return err
+			}
 		}
 		return nil
 	})
-
-	return true
 }
 
 func round(num float64) int {
@@ -216,32 +254,41 @@ func getTrackCellID(line string) s2.CellID {
 	return cellIDWithLevel(s2.CellIDFromLatLng(s2.LatLngFromDegrees(coords[1], coords[0])), *flagCellLevel)
 }
 
-func isCatTrackUniq(cat, trackLine string) bool {
-	cellid := getTrackCellID(trackLine)
-	if !trackCache(cat, cellid) {
-		return false
+func isCatTrackUniq(cat, trackLine string) (cellID s2.CellID, uniq bool) {
+	cellID = getTrackCellID(trackLine)
+	if trackCache(cat, cellID) {
+		uniq = false
+		return
 	}
-	if !trackDB(cat, cellid) {
-		return false
+	if err, exists := tracksDBExists(cat, cellID); err != nil {
+		log.Fatalln(err)
+	} else if exists {
+		uniq = false
+		return
 	}
-	return true
+	uniq = true
+	return
+}
+
+func getTrackTime(line []byte) time.Time {
+	return time.Time(gjson.GetBytes(line, "properties.Time").Time())
 }
 
 func main() {
 	flag.Parse()
 	compressionLevel = *flagCompression
 
-	var err error
-	db, err = bolt.Open(*flagDBPath, 0600, nil)
-	if err != nil {
-		log.Fatalln(err)
-	}
-	defer db.Close()
-
 	cache, _ = lru.New[string, bool](*flagCacheSize)
+	defer func() {
+		for cat, db := range dbs {
+			log.Printf("Closing DB %s\n", cat)
+			db.Close()
+		}
+	}()
 
 	// ensure output dir exists
 	_ = os.MkdirAll(*flagOutputRootFilepath, 0755)
+	_ = os.MkdirAll(*flagDBRootPath, 0755)
 
 	closeBatchName := func(lines [][]byte, last, next []byte) bool {
 		ll := len(lines)
@@ -261,35 +308,58 @@ func main() {
 	}
 	workCh := make(chan work, *flagWorkers)
 	for i := 0; i < *flagWorkers; i++ {
-		workerI := i
+		workerI := i + 1
 		go func() {
+			workerI := workerI
 			for w := range workCh {
 				defer workersWG.Done()
 				start := time.Now()
 
 				fname := filepath.Join(*flagOutputRootFilepath, fmt.Sprintf("%s.json.gz", w.name))
-				log.Printf("[worker=%02d] Deduping %s lines=%d...\n", workerI+1, w.name, len(w.lines))
+				log.Printf("[worker=%02d] Deduping %s lines=%d...\n", workerI, w.name, len(w.lines))
 
 				uniqLines := [][]byte{}
+				uniqCellIDs := []s2.CellID{}
 				for _, line := range w.lines {
-					if isCatTrackUniq(w.name, string(line)) {
+					cellID, uniq := isCatTrackUniq(w.name, string(line))
+					if uniq {
 						uniqLines = append(uniqLines, line)
+						uniqCellIDs = append(uniqCellIDs, cellID)
 					}
 				}
+				log.Printf("[worker=%02d] Deduped %s lines=%d uniq=%d took=%v\n", workerI, w.name, len(w.lines), len(uniqLines), time.Since(start))
 
-				log.Printf("[worker=%02d] Deduped lines=%d uniq=%d took=%v, gzipping to %s...\n", workerI+1, len(w.lines), len(uniqLines), time.Since(start), fname)
+				// noop if 0 unique lines
+				if len(uniqLines) == 0 {
+					continue
+				}
+
+				if err := tracksDBWriteUniqs(w.name, uniqCellIDs); err != nil {
+					log.Fatalln(err)
+				}
 
 				if err := appendGZipLines(uniqLines, fname); err != nil {
 					log.Fatalln(err)
 				}
-				log.Printf("[worker=%02d] Wrote %d unique lines to %s, took %s\n", workerI+1, len(uniqLines), fname, time.Since(start))
+				log.Printf("[worker=%02d] Wrote %d unique lines to %s, took %s\n", workerI, len(uniqLines), fname, time.Since(start))
 			}
 		}()
 	}
 
+	// these only used for pretty logging, to see track time progress
+	latestTrackTimePrefix := time.Time{}
+	lastTimeLogPrefixUpdate := time.Now()
+
 	handleLinesBatch := func(lines [][]byte) {
 		name := mustGetCatName(string(lines[0]))
-		log.Printf("Handle batch %s GOROUTINES %d LINES %d", name, runtime.NumGoroutine(), len(lines))
+
+		// update latest track time progress if stale
+		// don't do for every because it's unnecessarily expensive
+		if latestTrackTimePrefix.IsZero() || time.Since(lastTimeLogPrefixUpdate) > time.Second*10 {
+			latestTrackTimePrefix = getTrackTime(lines[0])
+			lastTimeLogPrefixUpdate = time.Now()
+		}
+		log.Printf("@ %s | Handle batch %s GOROUTINES %d LINES %d", latestTrackTimePrefix.Format("2006-01-02 15:04:05"), name, runtime.NumGoroutine(), len(lines))
 		workersWG.Add(1)
 		workCh <- work{name: name, lines: lines} //
 	}
