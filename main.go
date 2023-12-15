@@ -50,7 +50,7 @@ var flagCacheSize = flag.Int("cache-size", 1_000_000, "Size of cache for unique 
 var flagWorkers = flag.Int("workers", 8, "Number of workers")
 var flagBatchSize = flag.Int("batch-size", 1000, "Number of cat/lines per batch")
 var flagOutputRootFilepath = flag.String("output", outputRoot, "Output root dir")
-var flagDBRootPath = flag.String("db", filepath.Join(outputRoot, "dbs"), "Path to root dir for unique cat/tracks index dbs (one per cat)")
+var flagDBRootPath = flag.String("db-root", filepath.Join(outputRoot, "dbs"), "Path to root dir for unique cat/tracks index dbs (one per cat)")
 
 var dbs = make(map[string]*bolt.DB)
 var cache *lru.Cache[string, bool]
