@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang/geo/s2"
@@ -40,20 +41,63 @@ level 	min area 	max area 	average area 	units 	  	Random cell 1 (UK) min edge l
 29 	1.77 	3.71 	2.95 	cm2 	  	12 mm 	18 mm 	  	17 mm 	18 mm 	1729e15
 30 	0.44 	0.93 	0.74 	cm2 	  	6 mm 	9 mm 	  	8 mm 	9 mm 	7e18
 */
-var cellLevel = 23 // =~ 1.2m^2
-var compressionLevel = gzip.DefaultCompression
-var outputRoot = filepath.Join(".", "output")
+var defaultCellLevel = 23 // =~ 1.2m^2
+var defaultOutputRoot = filepath.Join(".", "output")
 
-var flagCellLevel = flag.Int("cell-level", cellLevel, fmt.Sprintf("S2 Cell Level (0-30, default=%d)", cellLevel))
-var flagCompression = flag.Int("compression-level", compressionLevel, fmt.Sprintf("Compression level (Default=%d, BestSpeed=%d, BestCompression=%d)", gzip.DefaultCompression, gzip.BestSpeed, gzip.BestCompression))
+var flagCellLevel = flag.Int("cell-level", defaultCellLevel, fmt.Sprintf("S2 Cell Level (0-30, default=%d)", defaultCellLevel))
+var flagCompressionLevel = flag.Int("compression-level", gzip.DefaultCompression, fmt.Sprintf("Compression level (Default=%d, BestSpeed=%d, BestCompression=%d)", gzip.DefaultCompression, gzip.BestSpeed, gzip.BestCompression))
 var flagCacheSize = flag.Int("cache-size", 1_000_000, "Size of cache for unique cat/tracks indexed by cellID")
 var flagWorkers = flag.Int("workers", 8, "Number of workers")
 var flagBatchSize = flag.Int("batch-size", 1000, "Number of cat/lines per batch")
-var flagOutputRootFilepath = flag.String("output", outputRoot, "Output root dir")
-var flagDBRootPath = flag.String("db-root", filepath.Join(outputRoot, "dbs"), "Path to root dir for unique cat/tracks index dbs (one per cat)")
+var flagOutputRootFilepath = flag.String("output", defaultOutputRoot, "Output root dir")
+var flagDBRootPath = flag.String("db-root", filepath.Join(defaultOutputRoot, "dbs"), "Path to root dir for unique cat/tracks index dbs (one per cat)")
+var flagDuplicateQuitLimit = flag.Int("duplicate-quit-limit", 0, "Number of sequential duplicate tracks to quit after")
+
+var aliases = map[*regexp.Regexp]string{
+	regexp.MustCompile("(?i)(Rye.*|Kitty.*|jl)"):                          "rye",
+	regexp.MustCompile(`(?i)(.*Papa.*|P2|Isaac.*|.*moto.*|iha|ubp52)`):    "ia",
+	regexp.MustCompile(`(?i)(Big.*Ma.*)`):                                 "jr",
+	regexp.MustCompile("(?i)Kayleigh.*"):                                  "kd",
+	regexp.MustCompile("(?i)(KK.*|kek)"):                                  "kk",
+	regexp.MustCompile("(?i)Bob.*"):                                       "rj",
+	regexp.MustCompile("(?i)(Pam.*|Rathbone.*)"):                          "pr",
+	regexp.MustCompile("(?i)(Ric|.*A3_Pixel_XL.*|.*marlin-Pixel-222d.*)"): "ric",
+	regexp.MustCompile("(?i)Twenty7.*"):                                   "mat",
+	regexp.MustCompile("(?i)(.*Carlomag.*|JLC|jlc)"):                      "jlc",
+}
+
+func aliasOrName(name string) string {
+	if name == "" {
+		return "_"
+	}
+	for r, a := range aliases {
+		if r.MatchString(name) {
+			return a
+		}
+	}
+	return name
+}
+
+func sanitizeName(name string) string {
+	if name == "" {
+		return "_"
+	}
+	name = strings.ReplaceAll(name, " ", "_")
+	name = strings.ReplaceAll(name, string(filepath.Separator), "_")
+	return name
+}
+
+func mustGetCatName(line string) string {
+	value := gjson.Get(line, "properties.Name").String()
+	return sanitizeName(aliasOrName(value))
+}
 
 var dbs = make(map[string]*bolt.DB)
 var cache *lru.Cache[string, bool]
+
+func dbBucket() []byte {
+	return []byte{byte(*flagCellLevel)}
+}
 
 func init() {
 	log.SetFlags(log.Lshortfile | log.LstdFlags)
@@ -130,7 +174,7 @@ func appendGZipLines(lines [][]byte, fname string) error {
 	}
 	defer fi.Close()
 
-	gzW, _ := gzip.NewWriterLevel(fi, compressionLevel)
+	gzW, _ := gzip.NewWriterLevel(fi, *flagCompressionLevel)
 	defer gzW.Close() // will happen before fi.Close()
 	defer gzW.Flush() // will happen before gzW.Close()
 
@@ -144,45 +188,6 @@ func appendGZipLines(lines [][]byte, fname string) error {
 		}
 	}
 	return nil
-}
-
-var aliases = map[*regexp.Regexp]string{
-	regexp.MustCompile("(?i)(Rye.*|Kitty.*|jl)"):                          "rye",
-	regexp.MustCompile(`(?i)(.*Papa.*|P2|Isaac.*|.*moto.*|iha|ubp52)`):    "ia",
-	regexp.MustCompile(`(?i)(Big.*Ma.*)`):                                 "jr",
-	regexp.MustCompile("(?i)Kayleigh.*"):                                  "kd",
-	regexp.MustCompile("(?i)(KK.*|kek)"):                                  "kk",
-	regexp.MustCompile("(?i)Bob.*"):                                       "rj",
-	regexp.MustCompile("(?i)(Pam.*|Rathbone.*)"):                          "pr",
-	regexp.MustCompile("(?i)(Ric|.*A3_Pixel_XL.*|.*marlin-Pixel-222d.*)"): "ric",
-	regexp.MustCompile("(?i)Twenty7.*"):                                   "mat",
-	regexp.MustCompile("(?i)(.*Carlomag.*|JLC|jlc)"):                      "jlc",
-}
-
-func aliasOrName(name string) string {
-	if name == "" {
-		return "_"
-	}
-	for r, a := range aliases {
-		if r.MatchString(name) {
-			return a
-		}
-	}
-	return name
-}
-
-func sanitizeName(name string) string {
-	if name == "" {
-		return "_"
-	}
-	name = strings.ReplaceAll(name, " ", "_")
-	name = strings.ReplaceAll(name, string(filepath.Separator), "_")
-	return name
-}
-
-func mustGetCatName(line string) string {
-	value := gjson.Get(line, "properties.Name").String()
-	return sanitizeName(aliasOrName(value))
 }
 
 // cellIDWithLevel returns the cellID truncated to the given level.
@@ -233,10 +238,6 @@ func cellIDDBKey(cat string, cellID s2.CellID) []byte {
 	return []byte(cellID.ToToken())
 }
 
-func dbBucket() []byte {
-	return []byte{byte(*flagCellLevel)}
-}
-
 // trackInCacheByCellID returns true if the given cellID for some cat exists in the LRU cache.
 // If not, it will be added to the cache.
 func trackInCacheByCellID(cat string, cellID s2.CellID) (exists bool) {
@@ -273,7 +274,7 @@ func getOrInitCatDB(cat string) *bolt.DB {
 	if db, ok := dbs[cat]; ok {
 		return db
 	}
-	db, err := bolt.Open(filepath.Join(*flagDBRootPath, fmt.Sprintf("%s-level.%d.db", cat, *flagCellLevel)), 0600, nil)
+	db, err := bolt.Open(filepath.Join(*flagDBRootPath, fmt.Sprintf("%s.db", cat)), 0600, nil)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -281,9 +282,9 @@ func getOrInitCatDB(cat string) *bolt.DB {
 	return db
 }
 
-// cat_tracksDBWriteUniqCellIDs writes the given cellIDs to the index db for the given cat.
+// dbWriteCellIDs writes the given cellIDs to the index db for the given cat.
 // TODO, maybe do something with the value stored.
-func cat_tracksDBWriteUniqCellIDs(cat string, cellIDs []s2.CellID) (err error) {
+func dbWriteCellIDs(cat string, cellIDs []s2.CellID) (err error) {
 	db := getOrInitCatDB(cat)
 	// defer db.Close() // nope, don't close it
 
@@ -303,8 +304,8 @@ func cat_tracksDBWriteUniqCellIDs(cat string, cellIDs []s2.CellID) (err error) {
 	})
 }
 
-// uniqsFromDB returns the cellIDs and tracklines that are not in the db.
-func uniqsFromDB(cat string, cellIDs []s2.CellID, trackLines [][]byte) (uniqCellIDs []s2.CellID, uniqTracklines [][]byte, err error) {
+// filterUniqFromDB filters the cellIDs and tracklines that are not in the db.
+func filterUniqFromDB(cat string, cellIDs []s2.CellID, trackLines [][]byte) (uniqCellIDs []s2.CellID, uniqTracklines [][]byte, err error) {
 	db := getOrInitCatDB(cat)
 	// defer db.Close()
 
@@ -331,10 +332,10 @@ func uniqsFromDB(cat string, cellIDs []s2.CellID, trackLines [][]byte) (uniqCell
 	return
 }
 
-// uniqCatTracks returns unique cellIDs and associated tracks for the given cat.
+// filterUniqCatTracks returns unique cellIDs and associated tracks for the given cat.
 // It attempts first to cross reference all tracks against the cache. This step returns the indices of the tracks that are not in the cache.
 // Those uncached tracks are then cross referenced against the index db.
-func uniqCatTracks(cat string, trackLines [][]byte) (uniqCellIDs []s2.CellID, uniqTracks [][]byte) {
+func filterUniqCatTracks(cat string, trackLines [][]byte) (uniqCellIDs []s2.CellID, uniqTracks [][]byte) {
 	if len(trackLines) == 0 {
 		log.Println("WARN: no lines to dedupe")
 		return uniqCellIDs, uniqTracks
@@ -365,22 +366,23 @@ func uniqCatTracks(cat string, trackLines [][]byte) (uniqCellIDs []s2.CellID, un
 	// we need to check the db for those that did not have cache hits
 
 	// further whittle the uniqs based on db hits/misses
-	_uniqCellIDs, _uniqTracks, err := uniqsFromDB(cat, tmpUniqCellIDs, tmpUniqTracks)
+	_uniqCellIDs, _uniqTracks, err := filterUniqFromDB(cat, tmpUniqCellIDs, tmpUniqTracks)
 	if err != nil {
 		log.Fatalln(err)
 	}
 	return _uniqCellIDs, _uniqTracks
 }
 
-// getYearMonth returns the year and month from the given line.
+// getTrackTime returns the Time value from the geojson track.
 // It's a helper function for pretty logging.
 func getTrackTime(line []byte) time.Time {
 	return time.Time(gjson.GetBytes(line, "properties.Time").Time())
 }
 
+var globalContinuousDuplicatesCounter = uint32(0)
+
 func main() {
 	flag.Parse()
-	compressionLevel = *flagCompression
 
 	cache, _ = lru.New[string, bool](*flagCacheSize)
 	defer func() {
@@ -406,13 +408,13 @@ func main() {
 		start := time.Now()
 
 		// fname is the name where unique tracks will be appended
-		fname := filepath.Join(*flagOutputRootFilepath, fmt.Sprintf("%s.json.gz", w.name))
+		fname := filepath.Join(*flagOutputRootFilepath, fmt.Sprintf("%s.level-%d.json.gz", w.name, *flagCellLevel))
 
 		workLogger := log.New(os.Stderr, fmt.Sprintf("[worker %02d] name=%s file=%s lines=%d ", workerI, w.name, fname, len(w.lines)), log.Lshortfile|log.LstdFlags)
 
 		// dedupe: x-check the cache and db for existing cells for these tracks.
 		// only unique tracks are returned.
-		uCellIDs, uTracks := uniqCatTracks(w.name, w.lines)
+		uCellIDs, uTracks := filterUniqCatTracks(w.name, w.lines)
 		if len(uCellIDs) != len(uTracks) {
 			log.Fatalln("len(uCellIDs) != len(uTracks)", len(uCellIDs), len(uTracks))
 		}
@@ -420,13 +422,19 @@ func main() {
 
 		// noop if 0 unique lines
 		if len(uCellIDs) == 0 {
+			atomic.AddUint32(&globalContinuousDuplicatesCounter, uint32(len(w.lines)))
+			if *flagDuplicateQuitLimit > 0 && atomic.LoadUint32(&globalContinuousDuplicatesCounter) > uint32(*flagDuplicateQuitLimit) {
+				log.Printf("Found %d consecutive duplicates, quitting...\n", globalContinuousDuplicatesCounter)
+				os.Exit(0)
+			}
 			return
 		}
+		atomic.StoreUint32(&globalContinuousDuplicatesCounter, 0)
 
 		start = time.Now()
 		// write the unique tracks to the index db
 		// the cache-check function will have already stored the unique cellIDs in the LRU cache
-		if err := cat_tracksDBWriteUniqCellIDs(w.name, uCellIDs); err != nil {
+		if err := dbWriteCellIDs(w.name, uCellIDs); err != nil {
 			log.Fatalln(err)
 		}
 
@@ -436,6 +444,7 @@ func main() {
 		}
 		workLogger.Printf("indexed and appended, took=%s\n", time.Since(start))
 	}
+
 	for i := 0; i < *flagWorkers; i++ {
 		workerI := i + 1
 		go func() {
@@ -450,9 +459,7 @@ func main() {
 	latestTrackTimePrefix := time.Time{}
 	lastTimeLogPrefixUpdate := time.Now()
 
-	handleLinesBatch := func(lines [][]byte) {
-		name := mustGetCatName(string(lines[0]))
-
+	prettyLogging := func(lines [][]byte) {
 		// update latest track time progress if stale
 		// don't do for every because it's unnecessarily expensive
 		if latestTrackTimePrefix.IsZero() || time.Since(lastTimeLogPrefixUpdate) > time.Second*5 {
@@ -460,10 +467,14 @@ func main() {
 			log.SetPrefix(fmt.Sprintf("🐈 %s | ", latestTrackTimePrefix.Format("2006-01-02")))
 			lastTimeLogPrefixUpdate = time.Now()
 		}
+	}
 
-		log.Printf("BATCH %s GOROUTINES %d LINES %d", name, runtime.NumGoroutine(), len(lines))
+	handleLinesBatch := func(lines [][]byte) {
+		prettyLogging(lines)
+		cat := mustGetCatName(string(lines[0]))
+		log.Printf("BATCH %s GOROUTINES %d LINES %d", cat, runtime.NumGoroutine(), len(lines))
 		workersWG.Add(1)
-		workCh <- work{name: name, lines: lines} //
+		workCh <- work{name: cat, lines: lines} //
 	}
 
 	linesCh, errCh, err := readLinesBatchingCats(os.Stdin, *flagBatchSize, *flagWorkers)

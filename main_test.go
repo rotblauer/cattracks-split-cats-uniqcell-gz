@@ -20,7 +20,7 @@ func TestGetCatTrackCellID(t *testing.T) {
 	*/
 	// var lsb uint64 = 1 << (2 * (30 - cellLevel))
 	// truncatedCellID := (uint64(cellID) & -lsb) | lsb
-	truncatedCellIDS2 := cellIDWithLevel(cellID, cellLevel)
+	truncatedCellIDS2 := cellIDWithLevel(cellID, defaultCellLevel)
 	t.Log(truncatedCellIDS2, truncatedCellIDS2.ToToken(), truncatedCellIDS2.Level(), truncatedCellIDS2.IsLeaf())
 
 }
