@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -54,16 +53,16 @@ var flagDBRootPath = flag.String("db-root", filepath.Join(defaultOutputRoot, "db
 var flagDuplicateQuitLimit = flag.Int("duplicate-quit-limit", 0, "Number of sequential duplicate tracks to quit after")
 
 var aliases = map[*regexp.Regexp]string{
-	regexp.MustCompile("(?i)(Rye.*|Kitty.*|jl)"):                          "rye",
+	regexp.MustCompile(`(?i)(Rye.*|Kitty.*|jl)`):                          "rye",
 	regexp.MustCompile(`(?i)(.*Papa.*|P2|Isaac.*|.*moto.*|iha|ubp52)`):    "ia",
 	regexp.MustCompile(`(?i)(Big.*Ma.*)`):                                 "jr",
-	regexp.MustCompile("(?i)Kayleigh.*"):                                  "kd",
-	regexp.MustCompile("(?i)(KK.*|kek)"):                                  "kk",
-	regexp.MustCompile("(?i)Bob.*"):                                       "rj",
-	regexp.MustCompile("(?i)(Pam.*|Rathbone.*)"):                          "pr",
-	regexp.MustCompile("(?i)(Ric|.*A3_Pixel_XL.*|.*marlin-Pixel-222d.*)"): "ric",
-	regexp.MustCompile("(?i)Twenty7.*"):                                   "mat",
-	regexp.MustCompile("(?i)(.*Carlomag.*|JLC|jlc)"):                      "jlc",
+	regexp.MustCompile(`(?i)Kayleigh.*`):                                  "kd",
+	regexp.MustCompile(`(?i)(KK.*|kek)`):                                  "kk",
+	regexp.MustCompile(`(?i)Bob.*`):                                       "rj",
+	regexp.MustCompile(`(?i)(Pam.*|Rathbone.*)`):                          "pr",
+	regexp.MustCompile(`(?i)(Ric|.*A3_Pixel_XL.*|.*marlin-Pixel-222d.*)`): "ric",
+	regexp.MustCompile(`(?i)Twenty7.*`):                                   "mat",
+	regexp.MustCompile(`(?i)(.*Carlomag.*|JLC|jlc)`):                      "jlc",
 }
 
 func aliasOrName(name string) string {
@@ -234,7 +233,7 @@ func cellIDCacheKey(cat string, cellID s2.CellID) string {
 	return fmt.Sprintf("%s:%s", cat, cellID.ToToken())
 }
 
-func cellIDDBKey(cat string, cellID s2.CellID) []byte {
+func cellIDDBKey(cellID s2.CellID) []byte {
 	return []byte(cellID.ToToken())
 }
 
@@ -282,49 +281,41 @@ func getOrInitCatDB(cat string) *bolt.DB {
 	return db
 }
 
-// dbWriteCellIDs writes the given cellIDs to the index db for the given cat.
-// TODO, maybe do something with the value stored.
-func dbWriteCellIDs(cat string, cellIDs []s2.CellID) (err error) {
-	db := getOrInitCatDB(cat)
-	// defer db.Close() // nope, don't close it
-
-	bucket := dbBucket()
-	return db.Update(func(tx *bolt.Tx) error {
-		b, err := tx.CreateBucketIfNotExists(bucket)
-		if err != nil {
-			return err
-		}
-		for _, cellID := range cellIDs {
-			err = b.Put(cellIDDBKey(cat, cellID), []byte{0x1})
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
-
-// filterUniqFromDB filters the cellIDs and tracklines that are not in the db.
-func filterUniqFromDB(cat string, cellIDs []s2.CellID, trackLines [][]byte) (uniqCellIDs []s2.CellID, uniqTracklines [][]byte, err error) {
+// filterUniqFromDBWriting filters the givens cellIDs and tracklines to those which were not found in the database.
+// The unique cells will be written before the function returns.
+// I think it's important to read+write in the same transaction, so that the db is not left in an inconsistent state
+// with multiple routines potentially accessing it.
+// I expect that bolt will lock the db for the duration of the transaction,
+// so that other routines will block until the transaction is complete.
+func filterUniqFromDBWriting(cat string, cellIDs []s2.CellID, trackLines [][]byte) (uniqCellIDs []s2.CellID, uniqTracklines [][]byte, err error) {
 	db := getOrInitCatDB(cat)
 	// defer db.Close()
 
 	bucket := dbBucket()
-	err = db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucket)
-		if b == nil {
-			// if no bucket has been yet created, all the cellIDs are unique
-			uniqCellIDs = make([]s2.CellID, len(cellIDs))
-			uniqTracklines = make([][]byte, len(cellIDs))
-			copy(uniqCellIDs, cellIDs)
-			copy(uniqTracklines, trackLines)
-			return nil
+	err = db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists(bucket)
+		if err != nil {
+			return err
 		}
+		// if b == nil {
+		// 	// if no bucket has been yet created, all the cellIDs are unique
+		// 	uniqCellIDs = make([]s2.CellID, len(cellIDs))
+		// 	uniqTracklines = make([][]byte, len(cellIDs))
+		// 	copy(uniqCellIDs, cellIDs)
+		// 	copy(uniqTracklines, trackLines)
+		// 	return nil
+		// }
 		for i, cellID := range cellIDs {
-			v := b.Get(cellIDDBKey(cat, cellID))
+			v := b.Get(cellIDDBKey(cellID))
 			if v == nil {
 				uniqCellIDs = append(uniqCellIDs, cellID)
 				uniqTracklines = append(uniqTracklines, trackLines[i])
+
+				// Write the new cell to the index.
+				err = b.Put(cellIDDBKey(cellID), []byte{0x1})
+				if err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -332,10 +323,12 @@ func filterUniqFromDB(cat string, cellIDs []s2.CellID, trackLines [][]byte) (uni
 	return
 }
 
-// filterUniqCatTracks returns unique cellIDs and associated tracks for the given cat.
+// filterAndIndexUniqCatTracks returns unique cellIDs and associated tracks for the given cat.
 // It attempts first to cross reference all tracks against the cache. This step returns the indices of the tracks that are not in the cache.
-// Those uncached tracks are then cross referenced against the index db.
-func filterUniqCatTracks(cat string, trackLines [][]byte) (uniqCellIDs []s2.CellID, uniqTracks [][]byte) {
+// Those uncached tracks are then cross referenced against the index db, which writes them if they are unique.
+// Only the DB-access part of the process is blocking, since the cache is only a nice-to-have and we
+// don't care if some cache misses are false negatives.
+func filterAndIndexUniqCatTracks(cat string, trackLines [][]byte) (uniqCellIDs []s2.CellID, uniqTracks [][]byte) {
 	if len(trackLines) == 0 {
 		log.Println("WARN: no lines to dedupe")
 		return uniqCellIDs, uniqTracks
@@ -366,7 +359,7 @@ func filterUniqCatTracks(cat string, trackLines [][]byte) (uniqCellIDs []s2.Cell
 	// we need to check the db for those that did not have cache hits
 
 	// further whittle the uniqs based on db hits/misses
-	_uniqCellIDs, _uniqTracks, err := filterUniqFromDB(cat, tmpUniqCellIDs, tmpUniqTracks)
+	_uniqCellIDs, _uniqTracks, err := filterUniqFromDBWriting(cat, tmpUniqCellIDs, tmpUniqTracks)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -422,8 +415,9 @@ func main() {
 		}
 	}()
 	defer func() {
-		for cat, db := range dbs {
+		for cat := range dbs {
 			log.Printf("Closing DB %s\n", cat)
+			db := getOrInitCatDB(cat)
 			db.Close()
 		}
 	}()
@@ -446,15 +440,17 @@ func main() {
 		// fname is the name where unique tracks will be appended
 		fname := filepath.Join(*flagOutputRootFilepath, fmt.Sprintf("%s.level-%d.json.gz", w.name, *flagCellLevel))
 
-		workLogger := log.New(os.Stderr, fmt.Sprintf("[worker %02d] name=%s file=%s lines=%d ", workerI, w.name, fname, len(w.lines)), log.Lshortfile|log.LstdFlags)
+		workLog := fmt.Sprintf("[worker %02d] name=%s file=%s lines=%d ", workerI, w.name, fname, len(w.lines))
+		log.Println(workLog)
 
 		// dedupe: x-check the cache and db for existing cells for these tracks.
 		// only unique tracks are returned.
-		uCellIDs, uTracks := filterUniqCatTracks(w.name, w.lines)
+		uCellIDs, uTracks := filterAndIndexUniqCatTracks(w.name, w.lines)
 		if len(uCellIDs) != len(uTracks) {
 			log.Fatalln("len(uCellIDs) != len(uTracks)", len(uCellIDs), len(uTracks))
 		}
-		workLogger.Printf("uniq=%d took=%v\n", len(uCellIDs), time.Since(start))
+		workLog += fmt.Sprintf("uniq=%d in %v ", len(uCellIDs), time.Since(start).Round(time.Millisecond))
+		log.Println(workLog)
 
 		defer func() {
 			recordCatStats(w.name, catstats{
@@ -475,17 +471,13 @@ func main() {
 		atomic.StoreUint32(&globalContinuousDuplicatesCounter, 0)
 
 		start = time.Now()
-		// write the unique tracks to the index db
-		// the cache-check function will have already stored the unique cellIDs in the LRU cache
-		if err := dbWriteCellIDs(w.name, uCellIDs); err != nil {
-			log.Fatalln(err)
-		}
 
 		// finally, append the unique tracks to the per-cat unique tracks file
 		if err := appendGZipLines(uTracks, fname); err != nil {
 			log.Fatalln(err)
 		}
-		workLogger.Printf("indexed and appended, took=%s\n", time.Since(start))
+		workLog += fmt.Sprintf("appended in %s", time.Since(start).Round(time.Millisecond))
+		log.Println(workLog)
 	}
 
 	for i := 0; i < *flagWorkers; i++ {
@@ -498,25 +490,14 @@ func main() {
 		}()
 	}
 
-	// these only used for pretty logging, to see track time progress
-	latestTrackTimePrefix := time.Time{}
-	lastTimeLogPrefixUpdate := time.Now()
-
 	// prettyLogging set the log prefix to the latest track time, nice to have to see rate of progress
-	prettyLogging := func(lines [][]byte) {
-		// update latest track time progress if stale
-		// don't do for every because it's unnecessarily expensive
-		if latestTrackTimePrefix.IsZero() || time.Since(lastTimeLogPrefixUpdate) > time.Second*5 {
-			latestTrackTimePrefix = getTrackTime(lines[0])
-			log.SetPrefix(fmt.Sprintf("🐈 %s | ", latestTrackTimePrefix.Format("2006-01-02")))
-			lastTimeLogPrefixUpdate = time.Now()
-		}
+	prettyLogging := func(cat string, lines [][]byte) {
+		log.Printf("🐈 %s lines=%d time=%s\n", cat, len(lines), getTrackTime(lines[0]).Format("2006-01-02"))
 	}
 
 	handleLinesBatch := func(lines [][]byte) {
-		prettyLogging(lines)
 		cat := mustGetCatName(string(lines[0]))
-		log.Printf("BATCH %s GOROUTINES %d LINES %d", cat, runtime.NumGoroutine(), len(lines))
+		prettyLogging(cat, lines)
 		workersWG.Add(1)
 		workCh <- work{name: cat, lines: lines} //
 	}
