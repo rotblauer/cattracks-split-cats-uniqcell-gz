@@ -381,10 +381,46 @@ func getTrackTime(line []byte) time.Time {
 
 var globalContinuousDuplicatesCounter = uint32(0)
 
+// catstats is a simple struct for tracking the number of unique and duplicate tracks for a given cat.
+// These will be recorded for each cat printed at the end.
+type catstats struct {
+	uniqTracks uint64
+	dupTracks  uint64
+}
+
+func (c catstats) String() string {
+	uniqPerc := float64(c.uniqTracks) / float64(c.uniqTracks+c.dupTracks) * 100
+	return fmt.Sprintf("uniq=%d uniq.perc=%.02f dup=%d total=%d", c.uniqTracks, uniqPerc, c.dupTracks, c.uniqTracks+c.dupTracks)
+}
+
+var stats = make(map[string]catstats)
+var statsMus = make(map[string]*sync.Mutex)
+
+func recordCatStats(cat string, s catstats) {
+	if _, ok := statsMus[cat]; !ok {
+		statsMus[cat] = new(sync.Mutex)
+	}
+	statsMus[cat].Lock()
+	defer statsMus[cat].Unlock()
+	if _, ok := stats[cat]; !ok {
+		stats[cat] = catstats{}
+	}
+	stats[cat] = catstats{
+		uniqTracks: stats[cat].uniqTracks + s.uniqTracks,
+		dupTracks:  stats[cat].dupTracks + s.dupTracks,
+	}
+}
+
 func main() {
 	flag.Parse()
 
 	cache, _ = lru.New[string, bool](*flagCacheSize)
+	defer func() {
+		// print all cat stats
+		for cat, s := range stats {
+			log.Printf("cat=%s %s\n", cat, s)
+		}
+	}()
 	defer func() {
 		for cat, db := range dbs {
 			log.Printf("Closing DB %s\n", cat)
@@ -419,6 +455,13 @@ func main() {
 			log.Fatalln("len(uCellIDs) != len(uTracks)", len(uCellIDs), len(uTracks))
 		}
 		workLogger.Printf("uniq=%d took=%v\n", len(uCellIDs), time.Since(start))
+
+		defer func() {
+			recordCatStats(w.name, catstats{
+				uniqTracks: uint64(len(uCellIDs)),
+				dupTracks:  uint64(len(w.lines) - len(uCellIDs)),
+			})
+		}()
 
 		// noop if 0 unique lines
 		if len(uCellIDs) == 0 {
@@ -459,6 +502,7 @@ func main() {
 	latestTrackTimePrefix := time.Time{}
 	lastTimeLogPrefixUpdate := time.Now()
 
+	// prettyLogging set the log prefix to the latest track time, nice to have to see rate of progress
 	prettyLogging := func(lines [][]byte) {
 		// update latest track time progress if stale
 		// don't do for every because it's unnecessarily expensive

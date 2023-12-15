@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 
-time cat ~/tdata/master.json.gz | zcat | go run . --workers 8 --batch-size 10000
+time cat ~/tdata/master.json.gz | zcat |\
+    go run . \
+    --workers 8 \
+    --cell-level 23 \
+    --batch-size 100000 \
+    --cache-size 10000000 \
+    --compression-level 9
 
 # year=$(date +%Y)
 # month=$(date +%m)
